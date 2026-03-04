@@ -36,10 +36,17 @@ Usage:
                                 [--output_prefix bestmodel]
 
 Outputs:
-    results/bestmodel_dev.txt              - dev set predictions (0 or 1 per line)
+    results/bestmodel_dev.txt              - dev set predictions (0 or 1 per line, 2094 lines)
     results/bestmodel_test.txt             - test set predictions (0 or 1 per line)
     results/bestmodel_dev_predictions.csv  - detailed prediction CSV with probabilities
     BestModel/bestmodel/                   - saved model checkpoint
+
+Note on dev.txt line count:
+    The official dev split contains 2094 entries, but par_id 8640 has an empty text
+    field and is removed during preprocessing, so the model produces 2093 predictions.
+    This script automatically re-inserts a "0" prediction at the correct position so
+    that dev.txt always has exactly 2094 lines, matching the official split expected
+    by the evaluation script.
 """
 
 import os
@@ -71,6 +78,10 @@ DEV_CSV   = os.path.join(PROCESSED_DIR, "dev.csv")
 TEST_CSV  = os.path.join(PROCESSED_DIR, "test.csv")
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# par_id of the empty-text entry removed during preprocessing
+MISSING_PAR_ID  = 8640
+DEV_TOTAL_LINES = 2094
 
 # ============================================================
 # Default hyperparameters
@@ -109,9 +120,33 @@ def get_device():
     return dev
 
 
-# ============================================================
-# Dataset (returns both binary label and orig_label)
-# ============================================================
+def fix_dev_predictions(preds, dev_csv_path):
+    """
+    The official dev split has DEV_TOTAL_LINES (2094) entries, but par_id=8640
+    has an empty text field and was removed during preprocessing, so the model
+    produces 2093 predictions. This function re-inserts a prediction of 0
+    (No-PCL) at the correct position so that dev.txt has exactly 2094 lines.
+
+    dev.csv is sorted by par_id ascending. We count how many rows have
+    par_id < 8640; that is the 0-based insertion index.
+    """
+    if len(preds) == DEV_TOTAL_LINES:
+        return list(preds)  
+
+    df_dev     = pd.read_csv(dev_csv_path, dtype={"par_id": str})
+    insert_pos = sum(1 for pid in df_dev["par_id"].tolist()
+                     if pid.isdigit() and int(pid) < MISSING_PAR_ID)
+
+    preds_fixed = list(preds)
+    preds_fixed.insert(insert_pos, 0)
+
+    print(f"  [dev.txt fix] Inserted '0' at line {insert_pos + 1} (par_id={MISSING_PAR_ID}, empty text).")
+    print(f"  [dev.txt fix] Lines: {len(preds)} -> {len(preds_fixed)}")
+    assert len(preds_fixed) == DEV_TOTAL_LINES, \
+        f"Expected {DEV_TOTAL_LINES} lines after fix, got {len(preds_fixed)}"
+    return preds_fixed
+
+
 class PCLMultiTaskDataset(Dataset):
     def __init__(self, texts, binary_labels, aux_labels, tokenizer, max_length: int):
         self.encodings = tokenizer(
@@ -408,13 +443,15 @@ def main(args):
     print(f"\n  TP={tp} | FP={fp} | FN={fn}")
     print(f"  Recall: {tp/(tp+fn+1e-9):.4f} | Precision: {tp/(tp+fp+1e-9):.4f}")
 
+    # Re-insert prediction for par_id=8640 (empty text, removed during preprocessing)
+    # so that dev.txt has exactly 2094 lines matching the official split.
+    dev_preds_fixed = fix_dev_predictions(dev_preds, DEV_CSV)
 
     dev_out = os.path.join(RESULTS_DIR, f"{args.output_prefix}_dev.txt")
     with open(dev_out, "w") as f:
-        for p in dev_preds:
+        for p in dev_preds_fixed:
             f.write(f"{p}\n")
-    print(f"\n  Saved: results/{args.output_prefix}_dev.txt ({len(dev_preds)} lines)")
-
+    print(f"\n  Saved: results/{args.output_prefix}_dev.txt ({len(dev_preds_fixed)} lines)")
 
     _, _, _, test_preds, _, _ = evaluate(best_model, test_loader, device, has_labels=False)
     test_out = os.path.join(RESULTS_DIR, f"{args.output_prefix}_test.txt")
@@ -445,7 +482,6 @@ def main(args):
     elif pcl_f1 >= 0.48:
         print(f" [PASS] Outperforms the official baseline (0.48).")
     print("=" * 70)
-
 
 
 def parse_args():
